@@ -19,6 +19,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -388,6 +389,18 @@ func TestBuildCheckpointJobPreservesPreparedEnvAndSharedMemory(t *testing.T) {
 
 	assert.Contains(t, main.Env, corev1.EnvVar{Name: "NATS_SERVER", Value: "nats://custom:4222"})
 	assert.Contains(t, main.Env, corev1.EnvVar{Name: "DYN_SYSTEM_PORT", Value: "10090"})
+	var restoreConfig struct {
+		Env map[string]*string `json:"env"`
+	}
+	require.NoError(t, json.Unmarshal(
+		[]byte(job.Spec.Template.Annotations[consts.CheckpointRestoreRuntimeConfigAnnotation]),
+		&restoreConfig,
+	))
+	require.NotNil(t, restoreConfig.Env["NATS_SERVER"])
+	assert.Equal(t, "nats://custom:4222", *restoreConfig.Env["NATS_SERVER"])
+	require.NotNil(t, restoreConfig.Env["DYN_SYSTEM_PORT"])
+	assert.Equal(t, "10090", *restoreConfig.Env["DYN_SYSTEM_PORT"])
+	assert.Nil(t, restoreConfig.Env["ETCD_ENDPOINTS"])
 	for _, env := range main.Env {
 		assert.NotEqual(t, "ETCD_ENDPOINTS", env.Name)
 		assert.NotEqual(t, "MODEL_EXPRESS_URL", env.Name)

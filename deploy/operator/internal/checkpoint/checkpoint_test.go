@@ -19,6 +19,7 @@ package checkpoint
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
@@ -48,6 +49,57 @@ func testIdentity() nvidiacomv1alpha1.DynamoCheckpointIdentity {
 	return nvidiacomv1alpha1.DynamoCheckpointIdentity{
 		Model:            "meta-llama/Llama-2-7b-hf",
 		BackendFramework: "vllm",
+	}
+}
+
+func decodeRestoreRuntimeConfig(
+	t *testing.T,
+	annotations map[string]string,
+) map[string]*string {
+	t.Helper()
+	var payload struct {
+		Env map[string]*string `json:"env"`
+	}
+	require.NoError(t, json.Unmarshal(
+		[]byte(annotations[consts.CheckpointRestoreRuntimeConfigAnnotation]),
+		&payload,
+	))
+	return payload.Env
+}
+
+func TestRestoreRuntimeEnvSpecs(t *testing.T) {
+	require.NoError(t, validateRestoreRuntimeEnvSpecs())
+	names := map[string]restoreRuntimeEnvSpec{}
+	for _, spec := range restoreRuntimeEnvSpecs {
+		names[spec.Name] = spec
+	}
+
+	require.Contains(t, names, "DYN_DISCOVERY_BACKEND")
+	assert.Equal(t, restoreRuntimeEnvConsumerParsedConfig, names["DYN_DISCOVERY_BACKEND"].Consumer)
+	require.NotNil(t, names["DYN_DISCOVERY_BACKEND"].DefaultWhenUnset)
+	assert.Equal(t, "etcd", *names["DYN_DISCOVERY_BACKEND"].DefaultWhenUnset)
+	assert.True(t, names["DYN_DISCOVERY_BACKEND"].RefreshesConfig)
+
+	require.Contains(t, names, "DYN_REQUEST_PLANE")
+	assert.Equal(t, restoreRuntimeEnvConsumerParsedConfig, names["DYN_REQUEST_PLANE"].Consumer)
+	require.NotNil(t, names["DYN_REQUEST_PLANE"].DefaultWhenUnset)
+	assert.Equal(t, "tcp", *names["DYN_REQUEST_PLANE"].DefaultWhenUnset)
+	assert.True(t, names["DYN_REQUEST_PLANE"].RefreshesConfig)
+
+	require.Contains(t, names, "DYN_EVENT_PLANE")
+	assert.Equal(t, restoreRuntimeEnvConsumerParsedConfig, names["DYN_EVENT_PLANE"].Consumer)
+	assert.Nil(t, names["DYN_EVENT_PLANE"].DefaultWhenUnset)
+	assert.True(t, names["DYN_EVENT_PLANE"].RefreshesConfig)
+
+	for _, name := range []string{
+		"NATS_SERVER",
+		"ETCD_ENDPOINTS",
+		"DYN_SYSTEM_PORT",
+		"DYN_KUBE_DISCOVERY_MODE",
+		"CONTAINER_NAME",
+	} {
+		require.Contains(t, names, name)
+		assert.True(t, names[name].SafeForAnnotation, name)
 	}
 }
 
@@ -595,6 +647,108 @@ func TestInjectCheckpointIntoPodSpec(t *testing.T) {
 			mountPaths[mount.Name] = mount.MountPath
 		}
 		assert.Equal(t, consts.PodInfoMountPath, mountPaths[consts.PodInfoVolumeName])
+	})
+
+	t.Run("metadata-aware restore projects runtime config", func(t *testing.T) {
+		podSpec := testPodSpec()
+		podSpec.Containers[0].Env = []corev1.EnvVar{
+			{Name: "DYN_DISCOVERY_BACKEND", Value: "kubernetes"},
+			{Name: "DYN_SYSTEM_PORT", Value: "9090"},
+			{Name: "NATS_SERVER", Value: "nats://nats:4222"},
+			{Name: "DYN_HEALTH_CHECK_ENABLED", Value: "false"},
+			{Name: "UNRELATED", Value: "ignored"},
+		}
+		annotations := map[string]string{}
+		info := &CheckpointInfo{Enabled: true, Ready: true, Identity: ptr.To(testIdentity())}
+		reader := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(testSnapshotAgentDaemonSet()).Build()
+
+		require.NoError(t, InjectCheckpointIntoPodSpecWithMetadataAndStorageConfig(
+			context.Background(),
+			reader,
+			testNamespace,
+			annotations,
+			podSpec,
+			info,
+			configv1alpha1.CheckpointStorageConfiguration{},
+			snapshotprotocol.DefaultSeccompLocalhostProfile,
+		))
+
+		env := decodeRestoreRuntimeConfig(t, annotations)
+		require.NotNil(t, env["DYN_DISCOVERY_BACKEND"])
+		assert.Equal(t, "kubernetes", *env["DYN_DISCOVERY_BACKEND"])
+		require.NotNil(t, env["DYN_SYSTEM_PORT"])
+		assert.Equal(t, "9090", *env["DYN_SYSTEM_PORT"])
+		require.NotNil(t, env["NATS_SERVER"])
+		assert.Equal(t, "nats://nats:4222", *env["NATS_SERVER"])
+		require.NotNil(t, env["DYN_HEALTH_CHECK_ENABLED"])
+		assert.Equal(t, "false", *env["DYN_HEALTH_CHECK_ENABLED"])
+		assert.Contains(t, env, "ETCD_ENDPOINTS")
+		assert.Nil(t, env["ETCD_ENDPOINTS"])
+		assert.NotContains(t, env, "UNRELATED")
+
+		volumes := map[string]corev1.Volume{}
+		for _, volume := range podSpec.Volumes {
+			volumes[volume.Name] = volume
+		}
+		require.Contains(t, volumes, consts.PodInfoVolumeName)
+		fields := map[string]string{}
+		for _, item := range volumes[consts.PodInfoVolumeName].DownwardAPI.Items {
+			if item.FieldRef != nil {
+				fields[item.Path] = item.FieldRef.FieldPath
+			}
+		}
+		assert.Equal(
+			t,
+			"metadata.annotations['"+consts.CheckpointRestoreRuntimeConfigAnnotation+"']",
+			fields[consts.PodInfoFileDynRestoreRuntimeConfig],
+		)
+	})
+
+	t.Run("multi-target restore omits conflicting per-container config", func(t *testing.T) {
+		podSpec := &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "engine-0", Image: "main:latest",
+					Command: []string{"python3"}, Args: []string{"-m", "dynamo.vllm"},
+					Env: []corev1.EnvVar{
+						{Name: "DYN_DISCOVERY_BACKEND", Value: "kubernetes"},
+						{Name: "DYN_SYSTEM_PORT", Value: "9090"},
+					},
+				},
+				{
+					Name: "engine-1", Image: "main:latest",
+					Command: []string{"python3"}, Args: []string{"-m", "dynamo.vllm"},
+					Env: []corev1.EnvVar{
+						{Name: "DYN_DISCOVERY_BACKEND", Value: "kubernetes"},
+						{Name: "DYN_SYSTEM_PORT", Value: "9091"},
+					},
+				},
+			},
+		}
+		annotations := map[string]string{}
+		info := &CheckpointInfo{
+			Enabled:                 true,
+			Ready:                   true,
+			Hash:                    testHash,
+			RestoreTargetContainers: []string{"engine-0", "engine-1"},
+		}
+		reader := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(testSnapshotAgentDaemonSet()).Build()
+
+		require.NoError(t, InjectCheckpointIntoPodSpecWithMetadataAndStorageConfig(
+			context.Background(),
+			reader,
+			testNamespace,
+			annotations,
+			podSpec,
+			info,
+			configv1alpha1.CheckpointStorageConfiguration{},
+			snapshotprotocol.DefaultSeccompLocalhostProfile,
+		))
+
+		env := decodeRestoreRuntimeConfig(t, annotations)
+		require.NotNil(t, env["DYN_DISCOVERY_BACKEND"])
+		assert.Equal(t, "kubernetes", *env["DYN_DISCOVERY_BACKEND"])
+		assert.NotContains(t, env, "DYN_SYSTEM_PORT")
 	})
 
 	t.Run("ready checkpoint targets the container named main", func(t *testing.T) {

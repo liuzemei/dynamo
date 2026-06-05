@@ -65,6 +65,12 @@ func buildCheckpointJob(
 	if targetContainer == nil {
 		return nil, fmt.Errorf("checkpoint job pod template: pod spec has no container named %q", targetContainerName)
 	}
+	if err := checkpoint.ApplyRestoreRuntimeConfigAnnotation(
+		podTemplate.Annotations,
+		targetContainer,
+	); err != nil {
+		return nil, fmt.Errorf("failed to apply checkpoint job restore runtime config: %w", err)
+	}
 	checkpoint.EnsurePodInfoMount(targetContainer)
 	checkpoint.ApplySharedMemoryVolumeAndMount(&podTemplate.Spec, targetContainer, ckpt.Spec.Job.SharedMemory)
 	// NewCheckpointJob handles control volume + readiness probe from the
