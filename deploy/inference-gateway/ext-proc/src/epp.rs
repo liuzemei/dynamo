@@ -566,6 +566,7 @@ impl Router {
         tokens: &[u32],
         is_disaggregated: bool,
         priority_jump: f64,
+        expected_output_tokens: Option<u32>,
         allowed_worker_ids: Option<HashSet<u64>>,
     ) -> Result<(WorkerWithDpRank, u32)> {
         if let Some(ref ids) = allowed_worker_ids {
@@ -592,7 +593,7 @@ impl Router {
                 false,
                 None,
                 priority_jump,
-                None,
+                expected_output_tokens,
                 allowed_worker_ids,
                 RoutingConstraints::default(),
             )
@@ -607,6 +608,7 @@ impl Router {
         tokens: &[u32],
         worker_id: u64,
         dp_rank: u32,
+        expected_output_tokens: Option<u32>,
     ) -> Result<()> {
         let decode_router = self.decode_router.clone();
         let publisher = self.replica_publisher.clone();
@@ -656,7 +658,7 @@ impl Router {
                     &tokens,
                     None,
                     cached_tokens,
-                    None,
+                    expected_output_tokens,
                     worker,
                     None,
                     Some(&router_config_override),
@@ -884,6 +886,25 @@ async fn spawn_replica_sync(
 /// in `lib/llm/src/preprocessor.rs`). Falls back to the deprecated
 /// `latency_sensitivity` alias for callers still on the old field name.
 /// Returns `0.0` when `nvext` is absent.
+/// Parse routing hints — `priority_jump` and expected output length (`osl`) —
+/// from `nvext.agent_hints`, directly from the raw request body. Used on the
+/// pick() hot path so hints survive both tokenization modes (the sidecar
+/// tokenizer returns tokens only). Returns `(0.0, None)` on parse failure.
+fn extract_hints(body_str: &str) -> (f64, Option<u32>) {
+    let Ok(request) = serde_json::from_str::<
+        dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest,
+    >(body_str) else {
+        return (0.0, None);
+    };
+    let priority_jump = extract_priority_jump(&request);
+    let osl = request
+        .nvext
+        .as_ref()
+        .and_then(|n| n.agent_hints.as_ref())
+        .and_then(|h| h.osl);
+    (priority_jump, osl)
+}
+
 fn extract_priority_jump(
     request: &dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest,
 ) -> f64 {
@@ -1609,14 +1630,20 @@ impl EndpointPicker for Router {
         // Precise external mode: tokenize via the sidecar (one local hop, not a
         // second round-trip to a worker). Otherwise tokenize locally (the
         // dynamo-worker preprocessor) or use the load-aware placeholder.
-        let (tokens, priority_jump) = if let Some(url) = self.tokenize_url.as_deref() {
-            let toks = remote_tokenize(url, body_str)
+        // Routing hints (priority, expected output length / OSL) from
+        // nvext.agent_hints, parsed independently of the tokenization mode
+        // (sidecar tokenization returns tokens only and would otherwise drop
+        // them). OSL feeds the decode-load projection in the scheduler so a
+        // worker holding many long-output requests is scored as more loaded.
+        let (priority_jump, osl) = extract_hints(body_str);
+        let tokens = if let Some(url) = self.tokenize_url.as_deref() {
+            remote_tokenize(url, body_str)
                 .await
-                .map_err(|e| PickError::TokenizationFailed(e.to_string()))?;
-            (toks, 0.0)
+                .map_err(|e| PickError::TokenizationFailed(e.to_string()))?
         } else {
             self.tokenize(body_str)
                 .map_err(|e| PickError::TokenizationFailed(e.to_string()))?
+                .0
         };
 
         // Try prefill routing first (disaggregated mode).
@@ -1672,7 +1699,7 @@ impl EndpointPicker for Router {
         };
 
         let (decode_worker, _overlap) = self
-            .route_decode(&tokens, is_disaggregated, priority_jump, Some(decode_ids))
+            .route_decode(&tokens, is_disaggregated, priority_jump, osl, Some(decode_ids))
             .await
             .map_err(|e| PickError::RoutingFailed(e.to_string()))?;
 
@@ -1708,6 +1735,7 @@ impl EndpointPicker for Router {
                     &tokens,
                     decode_worker.worker_id,
                     decode_worker.dp_rank,
+                    osl,
                 )
                 .await
         {
